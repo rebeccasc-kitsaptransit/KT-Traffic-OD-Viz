@@ -1,181 +1,409 @@
+"""
+Origin-Destination Analysis for Kitsap Transit
+Analyzes Streetlight OD data to evaluate travel patterns through commercial corridors
+"""
+
 import pandas as pd
 import numpy as np
-from collections import Counter
-import math
-import random
 import matplotlib.pyplot as plt
 import geopandas as gpd
 import contextily as ctx
-from shapely.geometry import Point, LineString, shape
-from geopandas import GeoDataFrame
 import geoplot as gplt
 import geoplot.crs as gcrs
+from shapely.geometry import Point, LineString
+from pathlib import Path
+import logging
+from typing import Dict, List, Tuple, Optional
+import seaborn as sns
+from matplotlib.ticker import FuncFormatter
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# read STL data
-school = pd.read_csv("Demand/Pima_OD_UA_team_School_2267_Travel/Pima_OD_UA_team_2267_od_all.csv")
-summer = pd.read_csv("Demand/Pima_OD_UA_team_Summer_7548_Travel/Pima_OD_UA_team_7548_od_all.csv")
-snow = pd.read_csv("Demand/Pima_OD_UA_team_Snowbirds_6202_Travel/Pima_OD_UA_team_6202_od_all.csv")
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-len(set(school['Origin Zone ID']))  # 1088
-len(set(school['Destination Zone ID']))  # 1081
+# File paths - UPDATE THESE FOR YOUR DATA
+DATA_PATHS = {
+    'commercial_od': r"C:\Users\rebeccasc\Documents\Scripts\BI_commerce_TDM\2014263_BI_Commecial_OD_all_vehicles\2014263_BI_Commecial_OD_all_vehicles_od_trip_all.csv",
+    'trip_purpose': r"C:\Users\rebeccasc\Documents\Scripts\BI_commerce_TDM\2014261_BI_Corridor_Volume_2025_dayparts_purpose.csv",
+    'middle_filter': r"C:\Users\rebeccasc\Documents\Scripts\BI_commerce_TDM\2013907_BI_Corridor_Volume_2024_mf_all.csv"
+}
 
-len(set(summer['Origin Zone ID']))  # 1083
-len(set(summer['Destination Zone ID']))  # 1084
+# Output directory
+OUTPUT_DIR = Path("./output/od_analysis")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-len(set(snow['Origin Zone ID']))  # 1087
-len(set(snow['Destination Zone ID']))  # 1091
+# Kitsap Transit Operating Hours
+TRANSIT_HOURS = {
+    'weekday': {'start': 4.5, 'end': 19.25, 'label': 'Weekday (4:30 AM - 7:15 PM)'},
+    'saturday': {'start': 9.0, 'end': 18.0, 'label': 'Saturday (9:00 AM - 6:00 PM)'},
+    'sunday': {'start': 9.0, 'end': 16.0, 'label': 'Sunday (9:00 AM - 4:00 PM)'}
+}
 
-taz = gpd.read_file("D:/A - Project/TucsonModel/Pima-County---Regional_2017_TAZ_ZoneSet/zone_set_2017_TAZ.shp")
-# ------------------ pre-processing ---------------------
-input_file = school
-# demand - summer, school, snow
-demand_dt = input_file
-demand_dt.columns
-set(demand_dt['Day Type'])
-demand_dt = demand_dt[demand_dt['Day Type'] == '1: Average Weekday (M-Th)']
+# Commercial corridors (destinations/middle filters)
+COMMERCIAL_CORRIDORS = [
+    'HIGH_SCHOOL_RD',      # Just west of 305 intersection until Sportsman Club Road
+    'SPORTSMAN_CLUB',      # From Woodward Middle School/Coppertop until just before 305
+    'SR305_MID',           # Just north of High School Road until Sportsman Club Road
+    'SR305_N',             # North of Sportsman Club Road, over Agate Pass, to Kingston Ferry turnoff
+    'SR305_S',             # Below Winslow Way & Olympic until just south of High School Road
+    'WINSLOW_WAY',         # Just west of 305 along corridor until Madison Ave
+    'LYNWOOD_CENTER'       # South end commercial zone
+]
 
-# keep only O, D, OD traffic
-demand_dt = demand_dt[['Origin Zone ID', 'Destination Zone ID', 'Day Part', 'O-D Traffic (Calibrated Index)']]
-# remove redundant rows!
-set(demand_dt['Day Part'])
-demand_dt = demand_dt[demand_dt['Day Part'] != '00: All Day (12am-12am)']
-demand_dt['time'] = demand_dt['Day Part'].astype(str).str[4:8]
-demand_dt = demand_dt.drop('Day Part', axis=1)
-# Counter(demand_dt['time'])
-demand_dt.rename(columns={'Origin Zone ID': 'Orig',
-                          'Destination Zone ID': 'Dest'},
-                 inplace=True)
-set(demand_dt['time'])
+# Time periods (aggregated)
+TIME_PERIODS = {
+    '0: All Day (12am-12am)': 'All Day',
+    '1: Early AM (12am-6am)': 'Early AM',
+    '2: Peak AM (6am-10am)': 'Peak AM',
+    '3: Mid-Day (10am-3pm)': 'Mid-Day',
+    '4: Peak PM (3pm-7pm)': 'Peak PM',
+    '5: Late PM (7pm-12am)': 'Late PM'
+}
 
-# total missing rate
-(1-len(demand_dt)/(1104*1104*24))*100 # 95.68399099344501
+TIME_PERIOD_ORDER = ['1: Early AM (12am-6am)', '2: Peak AM (6am-10am)', 
+                      '3: Mid-Day (10am-3pm)', '4: Peak PM (3pm-7pm)', 
+                      '5: Late PM (7pm-12am)', '0: All Day (12am-12am)']
 
-# ------------------ departure time distribution ---------------------
-time_OD_count = demand_dt.groupby('time')['O-D Traffic (Calibrated Index)'].sum()
-time_OD_count = time_OD_count.reindex(['12am', '1am ', '2am ', '3am ', '4am ', '5am ', '6am ', '7am ', '8am ',
-                                       '9am ', '10am', '11am', '12pm', '1pm ', '2pm ', '3pm ', '4pm ',
-                                       '5pm ', '6pm ', '7pm ', '8pm ', '9pm ', '10pm', '11pm'])
-time_OD_count = time_OD_count*100/demand_dt['O-D Traffic (Calibrated Index)'].sum()
-plt.figure(figsize=(18, 12))
-time_OD_count.plot(kind='bar', width=0.8)
-plt.title("Snowbirds Season Departure Time Distribution", fontsize=22)
-plt.xticks(fontsize=16)
-plt.yticks(fontsize=16)
-plt.xlabel('Hour', fontsize=18)
-plt.ylabel('% of total OD pairs', fontsize=18)
+# Day types
+DAY_TYPES = [
+    '0: All Days (M-Su)',
+    '1: Weekday (M-Th)',
+    '2: Friday (F-F)',
+    '3: Saturday (Sa-Sa)',
+    '4: Sunday (Su-Su)'
+]
 
-# ------------------ complement missing OD's  ---------------------
-# create example 1-1104, 0-23
-x1 = 1
-x2 = 1104  # number of zones
-x = list(range(x1, x2 + 1))
-Orig = np.repeat(x, x2)
-len(Orig)  # 1218816
-Orig = list(Orig) * 24
+# Trip purposes
+TRIP_PURPOSES = {
+    'Home to Work': 'Home-Based Work',
+    'Home to Other': 'Home-Based Other', 
+    'Non-Home Based Trip': 'Non-Home Based'
+}
 
-x1 = 1
-x2 = 1104  # number of zones
-x = list(range(x1, x2 + 1))
-Dest = x * x2
-len(Dest)  # 1218816
-Dest = list(Dest) * 24
+# Volume column
+VOLUME_COL = 'Average Daily O-D Traffic (StL Volume)'
+TRIP_LENGTH_COL = 'Avg Trip Length (mi)'
+TRIP_SPEED_COL = 'Avg Trip Speed (mph)'
 
-# hr = list(range(0, 1380 + 60, 60))
-hr = list(['12am', '1am ', '2am ', '3am ', '4am ', '5am ', '6am ', '7am ', '8am ',
-           '9am ', '10am', '11am', '12pm', '1pm ', '2pm ', '3pm ', '4pm ',
-           '5pm ', '6pm ', '7pm ', '8pm ', '9pm ', '10pm', '11pm'])
-hr = np.repeat(hr, 1218816)
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 
-example = pd.DataFrame({'Orig': Orig, 'Dest': Dest, 'time': hr})
-example.shape
+def comma_formatter(x, p):
+    """Format numbers with commas"""
+    return format(int(x), ',')
 
-od_complete = example.merge(demand_dt, on=['Orig', 'Dest', 'time'], how='left')
+comma_fmt = FuncFormatter(comma_formatter)
 
-# ------------------ missing rate ---------------------
-# missing rate by hour
-missing = od_complete[pd.isnull(od_complete['O-D Traffic (Calibrated Index)'])]
-len(missing)
+def extract_hour(period_str):
+    """Extract hour number from period string"""
+    try:
+        return int(str(period_str).split(':')[0])
+    except:
+        return None
 
-time_OD_count = missing[['time', 'O-D Traffic (Calibrated Index)']].fillna(-1).groupby('time').count()/(1104*1104)
-time_OD_count = time_OD_count.reindex(['12am', '1am ', '2am ', '3am ', '4am ', '5am ', '6am ', '7am ', '8am ',
-                                       '9am ', '10am', '11am', '12pm', '1pm ', '2pm ', '3pm ', '4pm ',
-                                       '5pm ', '6pm ', '7pm ', '8pm ', '9pm ', '10pm', '11pm'])
+def get_day_category(day_type):
+    """Categorize day type for transit lookup"""
+    day_str = str(day_type).lower()
+    if 'weekday' in day_str or 'm-th' in day_str:
+        return 'weekday'
+    elif 'friday' in day_str:
+        return 'weekday'  # Friday uses weekday hours
+    elif 'saturday' in day_str:
+        return 'saturday'
+    elif 'sunday' in day_str:
+        return 'sunday'
+    return 'weekday'
 
-plt.figure(figsize=(12, 8))
-# time_OD_count.plot(kind='bar', width=0.8)
-y_pos = np.arange(len(time_OD_count['O-D Traffic (Calibrated Index)'].index))
-performance = time_OD_count['O-D Traffic (Calibrated Index)']
-plt.bar(y_pos, performance, align='center', alpha=0.5)
-plt.title("Average percent of missing OD pairs by hour", fontsize=22)
-plt.xticks(fontsize=16)
-plt.yticks(fontsize=16)
-plt.xlabel('Hour', fontsize=18)
-plt.ylabel('# of missing pairs/theoretical # pairs in an hour', fontsize=18)
+def is_during_transit(day_part, day_category):
+    """Determine if time period falls within transit hours"""
+    if day_category not in TRANSIT_HOURS:
+        return False
+    
+    # Peak periods are during service for most days
+    if day_part in ['2: Peak AM (6am-10am)', '3: Mid-Day (10am-3pm)', '4: Peak PM (3pm-7pm)']:
+        if day_category == 'sunday' and day_part == '2: Peak AM (6am-10am)':
+            return False
+        if day_category == 'saturday' and day_part == '4: Peak PM (3pm-7pm)':
+            return day_part == '4: Peak PM (3pm-7pm)'  # Saturday PM is within service
+        return True
+    
+    return False
 
-# ------------------ major OD pair missing rate - --------------------
-pairs = demand_dt[['Orig',
-                   'Dest',
-                   'O-D Traffic (Calibrated Index)']].groupby(['Orig','Dest']).mean().reset_index()
-pairs = pairs.sort_values(by=['O-D Traffic (Calibrated Index)'], ascending=False)
-imp_pairs = pairs[pairs['O-D Traffic (Calibrated Index)'] >= 5] # traffic greater than 50 vehicles
-len(imp_pairs) # 1905
-len(imp_pairs)/(1104*1104) # 0.007653329132535182
+# =============================================================================
+# DATA LOADING
+# =============================================================================
 
-imp_demand = demand_dt.merge(imp_pairs[['Orig','Dest']], on=['Orig', 'Dest'], how='inner')
-npairs = imp_demand[['Orig',
-                     'Dest',
-                     'O-D Traffic (Calibrated Index)']].groupby(['Orig','Dest']).count().reset_index()
-npairs['missing'] = 1 - npairs['O-D Traffic (Calibrated Index)']/24
-np.mean(npairs['missing']) # 0.546450650371641
-# daytime
-imp_demand_day = imp_demand[imp_demand['time'].isin(['8am ', '9am ', '10am', '11am', '12pm',
-                                                 '1pm ', '2pm ', '3pm ', '4pm ', '5pm '])]
-npairs_day = imp_demand_day[['Orig','Dest',
-                         'O-D Traffic (Calibrated Index)']].groupby(['Orig','Dest']).count().reset_index()
-npairs_day['missing'] = 1 - npairs_day['O-D Traffic (Calibrated Index)']/10
-np.mean(npairs_day['missing']) # 0.31049716957912876
+def load_data(file_path: str) -> pd.DataFrame:
+    """Load and validate input data"""
+    try:
+        df = pd.read_csv(file_path)
+        logger.info(f"Successfully loaded {len(df):,} records from {Path(file_path).name}")
+        return df
+    except Exception as e:
+        logger.error(f"Failed to load {file_path}: {e}")
+        raise
 
-# comparison
-plt.figure(figsize=(12, 8))
-plt.hist(npairs['missing'], bins=10, edgecolor='black', color='green', label='24 hours', alpha=0.5)
-plt.hist(npairs_day['missing'], bins=10, edgecolor='black', color='tomato', label='Daytime: 8AM-5PM', alpha=0.7)
-plt.title("Important Pairs Missing Rate Distribution", fontsize=22)
-plt.xticks(fontsize=16)
-plt.yticks(fontsize=16)
-plt.xlabel('Missing Rate', fontsize=18)
-plt.ylabel('# of OD pairs', fontsize=18)
-plt.legend(loc='upper right', fontsize=16)
+# =============================================================================
+# ANALYSIS 1: COMMERCIAL OD PATTERNS
+# =============================================================================
 
-# higher missing rate spatial viz
-severe_miss = npairs_day[npairs_day['missing'] >= 0.6]
-centroid = taz.centroid
-centroid_xy = pd.DataFrame({'Orig': centroid.index+1, 'Orig_x': centroid.x, 'Orig_y': centroid.y})
-severe_miss = severe_miss.merge(centroid_xy, on='Orig')
-centroid_xy = pd.DataFrame({'Dest': centroid.index+1, 'Dest_x': centroid.x, 'Dest_y': centroid.y})
-severe_miss = severe_miss.merge(centroid_xy, on='Dest')
-gdf = gpd.GeoDataFrame(severe_miss,
-                       geometry=[Point(x1, y1) for x1, y1, in zip(severe_miss.Orig_x, severe_miss.Orig_y)])
-gdf = gdf.rename({'geometry': 'Point1'}, axis=1)
-gdf = gpd.GeoDataFrame(gdf,
-                       geometry=[Point(x2, y2) for x2, y2, in zip(severe_miss.Dest_x, severe_miss.Dest_y)])
-gdf = gdf.rename({'geometry': 'Point2'}, axis=1)
-gdf['geometry'] = gdf.apply(lambda x: LineString([x['Point1'], x['Point2']]), axis=1)
+def analyze_commercial_patterns(df: pd.DataFrame) -> Dict:
+    """
+    Analyze traffic patterns to/from commercial corridors
+    """
+    results = {}
+    
+    # Filter for commercial corridors as destinations
+    commercial_df = df[df['Destination Zone Name'].isin(COMMERCIAL_CORRIDORS)].copy()
+    
+    # Add derived columns
+    commercial_df['Day_Category'] = commercial_df['Day Type'].apply(get_day_category)
+    commercial_df['During_Transit'] = commercial_df.apply(
+        lambda row: is_during_transit(row['Day Part'], row['Day_Category']), axis=1
+    )
+    
+    # Overall statistics
+    results['total_volume'] = commercial_df[VOLUME_COL].sum()
+    results['volume_by_corridor'] = commercial_df.groupby('Destination Zone Name')[VOLUME_COL].sum().sort_values(ascending=False)
+    
+    # Transit coverage
+    during = commercial_df[commercial_df['During_Transit']][VOLUME_COL].sum()
+    outside = commercial_df[~commercial_df['During_Transit']][VOLUME_COL].sum()
+    results['during_transit_pct'] = (during / results['total_volume'] * 100) if results['total_volume'] > 0 else 0
+    results['outside_transit_pct'] = (outside / results['total_volume'] * 100) if results['total_volume'] > 0 else 0
+    
+    # By time period
+    results['volume_by_period'] = commercial_df.groupby('Day Part')[VOLUME_COL].sum()
+    
+    logger.info(f"Commercial analysis complete: {results['total_volume']:,.0f} total trips")
+    return results
 
-g_part = gdf.sample(n=int(np.ceil(0.009*len(gdf))))
-len(g_part)
-# 32.206095, -111.047813
-ax = gplt.webmap(taz, figsize=(18, 12), projection=gcrs.WebMercator())
-gplt.sankey(
-    g_part, limits=(2, 5),
-    scale='missing', ax=ax,
-    legend=True
-)
+# =============================================================================
+# ANALYSIS 2: TRIP LENGTH DISTRIBUTION
+# =============================================================================
 
-# ------------------ major OD pair by hour - --------------------
-pairs = demand_dt[['Orig', 'Dest', 'time',
-                   'O-D Traffic (Calibrated Index)']].groupby(['Orig','Dest','time']).mean().reset_index()
-pairs = pairs[pairs['time'].isin(['5pm '])]
-pairs = pairs.sort_values(by=['O-D Traffic (Calibrated Index)'], ascending=False)
+def analyze_trip_lengths(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Analyze trip length distributions by corridor
+    Identifies short trips (<4 miles) that are candidates for mode shift
+    """
+    # Filter for commercial corridors
+    commercial_df = df[df['Destination Zone Name'].isin(COMMERCIAL_CORRIDORS)].copy()
+    
+    # Create length categories
+    def categorize_length(length):
+        if pd.isna(length):
+            return 'Unknown'
+        elif length < 2:
+            return 'Very Short (0-2 mi)'
+        elif length < 4:
+            return 'Short (2-4 mi)'
+        elif length < 7:
+            return 'Medium (4-7 mi)'
+        elif length < 15:
+            return 'Long (7-15 mi)'
+        else:
+            return 'Very Long (15+ mi)'
+    
+    commercial_df['Length_Category'] = commercial_df[TRIP_LENGTH_COL].apply(categorize_length)
+    
+    # Calculate distribution by corridor
+    length_dist = pd.crosstab(
+        commercial_df['Destination Zone Name'],
+        commercial_df['Length_Category'],
+        values=commercial_df[VOLUME_COL],
+        aggfunc='sum',
+        normalize='index'
+    ) * 100
+    
+    # Calculate short trip total (<4 miles)
+    commercial_df['Is_Short_Trip'] = commercial_df[TRIP_LENGTH_COL] < 4
+    short_by_corridor = commercial_df.groupby('Destination Zone Name').apply(
+        lambda x: (x[x['Is_Short_Trip']][VOLUME_COL].sum() / x[VOLUME_COL].sum() * 100)
+        if x[VOLUME_COL].sum() > 0 else 0
+    )
+    
+    logger.info("Trip length analysis complete")
+    return length_dist, short_by_corridor
 
-pairs.loc[(pairs['Orig'] == 380) & (pairs['Dest'] == 487)]
+# =============================================================================
+# ANALYSIS 3: MISSING DATA PATTERNS
+# =============================================================================
+
+def analyze_missing_patterns(df: pd.DataFrame, total_zones: int = 1104) -> Dict:
+    """
+    Analyze missing OD pair patterns
+    Adapted from original code for Kitsap context
+    """
+    results = {}
+    
+    # Calculate missing rate by hour
+    all_possible_pairs = total_zones * total_zones
+    hourly_counts = df.groupby('time').size()
+    hourly_possible = pd.Series(all_possible_pairs, index=hourly_counts.index)
+    results['hourly_missing_rate'] = 1 - (hourly_counts / hourly_possible)
+    
+    # Identify important OD pairs (high volume)
+    pair_volume = df.groupby(['Orig', 'Dest'])[VOLUME_COL].mean().reset_index()
+    threshold = pair_volume[VOLUME_COL].quantile(0.9)  # Top 10% by volume
+    important_pairs = pair_volume[pair_volume[VOLUME_COL] >= threshold]
+    
+    results['important_pairs_count'] = len(important_pairs)
+    results['important_pairs_pct'] = len(important_pairs) / all_possible_pairs * 100
+    
+    # Missing rate for important pairs
+    important_data = df.merge(important_pairs[['Orig', 'Dest']], on=['Orig', 'Dest'], how='inner')
+    hourly_coverage = important_data.groupby('time').size()
+    results['important_hourly_missing'] = 1 - (hourly_coverage / (len(important_pairs) * 24))
+    
+    logger.info(f"Missing data analysis complete: {results['important_pairs_count']} important pairs identified")
+    return results
+
+# =============================================================================
+# VISUALIZATION FUNCTIONS
+# =============================================================================
+
+def plot_volume_heatmap(df: pd.DataFrame, corridor: str, output_path: Path):
+    """Create volume heatmap for a specific corridor"""
+    corridor_data = df[df['Destination Zone Name'] == corridor]
+    
+    if len(corridor_data) == 0:
+        logger.warning(f"No data for corridor: {corridor}")
+        return
+    
+    # Create pivot table
+    pivot = corridor_data.pivot_table(
+        values=VOLUME_COL,
+        index='Day Part',
+        columns='Day Type',
+        aggfunc='sum',
+        fill_value=0
+    )
+    
+    # Reorder
+    pivot = pivot.reindex([p for p in TIME_PERIOD_ORDER if p in pivot.index])
+    pivot = pivot[[c for c in DAY_TYPES if c in pivot.columns]]
+    
+    if len(pivot) == 0:
+        return
+    
+    # Create heatmap
+    fig, ax = plt.subplots(figsize=(12, 8))
+    sns.heatmap(pivot, annot=True, fmt='.0f', cmap='YlOrRd', 
+                linewidths=0.5, ax=ax, cbar_kws={'label': 'Volume'})
+    
+    # Format labels
+    ax.set_yticklabels([TIME_PERIODS.get(p.get_text(), p.get_text()) for p in ax.get_yticklabels()])
+    ax.set_title(f'Traffic Volume - {corridor}\nTotal: {corridor_data[VOLUME_COL].sum():,.0f}', fontsize=14)
+    ax.set_xlabel('Day Type')
+    ax.set_ylabel('Time Period')
+    
+    plt.tight_layout()
+    plt.savefig(output_path / f'volume_heatmap_{corridor}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_missing_rate_distribution(missing_rates: pd.Series, output_path: Path):
+    """Plot missing rate by hour"""
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    x_pos = np.arange(len(missing_rates.index))
+    ax.bar(x_pos, missing_rates.values, align='center', alpha=0.7, color='steelblue')
+    
+    ax.set_title("Missing OD Pair Rate by Hour", fontsize=16)
+    ax.set_xlabel('Hour', fontsize=12)
+    ax.set_ylabel('Missing Rate', fontsize=12)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(missing_rates.index, rotation=45)
+    ax.set_ylim(0, 1)
+    ax.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_path / 'missing_rate_by_hour.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def plot_corridor_comparison(volume_by_corridor: pd.Series, output_path: Path):
+    """Plot comparison of volumes across corridors"""
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    volume_by_corridor.sort_values().plot(kind='barh', ax=ax, color='steelblue', alpha=0.8)
+    
+    ax.set_title('Traffic Volume by Commercial Corridor', fontsize=16)
+    ax.set_xlabel('Volume', fontsize=12)
+    ax.set_ylabel('Corridor', fontsize=12)
+    ax.xaxis.set_major_formatter(comma_fmt)
+    ax.grid(axis='x', alpha=0.3)
+    
+    # Add value labels
+    for i, v in enumerate(volume_by_corridor.sort_values().values):
+        ax.text(v + 100, i, f'{v:,.0f}', va='center')
+    
+    plt.tight_layout()
+    plt.savefig(output_path / 'corridor_volume_comparison.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def main():
+    """Main execution function"""
+    logger.info("Starting Kitsap Transit OD Analysis")
+    
+    # Load data
+    df = load_data(DATA_PATHS['commercial_od'])
+    
+    # Add hour column for time-based analysis
+    df['Hour'] = df['Day Part'].apply(extract_hour)
+    
+    # Run analyses
+    logger.info("Running commercial pattern analysis...")
+    commercial_results = analyze_commercial_patterns(df)
+    
+    logger.info("Running trip length analysis...")
+    length_dist, short_by_corridor = analyze_trip_lengths(df)
+    
+    # Create visualizations
+    viz_dir = OUTPUT_DIR / 'visualizations'
+    viz_dir.mkdir(exist_ok=True)
+    
+    # Volume heatmaps for each corridor
+    for corridor in COMMERCIAL_CORRIDORS:
+        plot_volume_heatmap(df, corridor, viz_dir)
+    
+    # Corridor comparison
+    plot_corridor_comparison(commercial_results['volume_by_corridor'], viz_dir)
+    
+    # Save results
+    results_df = pd.DataFrame({
+        'Metric': ['Total Volume', 'During Transit %', 'Outside Transit %'],
+        'Value': [
+            commercial_results['total_volume'],
+            commercial_results['during_transit_pct'],
+            commercial_results['outside_transit_pct']
+        ]
+    })
+    results_df.to_csv(OUTPUT_DIR / 'summary_results.csv', index=False)
+    
+    # Save length distribution
+    length_dist.to_csv(OUTPUT_DIR / 'trip_length_distribution.csv')
+    
+    # Summary report
+    with open(OUTPUT_DIR / 'analysis_summary.txt', 'w') as f:
+        f.write("KITSAP TRANSIT OD ANALYSIS SUMMARY\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Total commercial corridor volume: {commercial_results['total_volume']:,.0f}\n")
+        f.write(f"During transit hours: {commercial_results['during_transit_pct']:.1f}%\n")
+        f.write(f"Outside transit hours: {commercial_results['outside_transit_pct']:.1f}%\n\n")
+        f.write("Volume by Corridor:\n")
+        for corridor, volume in commercial_results['volume_by_corridor'].items():
+            f.write(f"  {corridor}: {volume:,.0f}\n")
+    
+    logger.info(f"Analysis complete. Results saved to {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
